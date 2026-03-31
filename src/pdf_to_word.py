@@ -153,6 +153,7 @@ class PDFToWordConverter:
     DOC_MARGIN_LEFT_CM = 2.0
     DOC_MARGIN_RIGHT_CM = 2.0
     POINTS_PER_CM = 28.3464567
+    SENTENCE_ENDINGS = (".", ":", ";", "?", "!")
 
     def __init__(self, ocr_callback: Optional[Callable[[Image.Image], str]] = None):
         self.ocr_callback = ocr_callback
@@ -258,7 +259,7 @@ class PDFToWordConverter:
 
         content = page.get_text("dict", sort=True)
         tables = self._extract_tables(page) if extract_tables else []
-        text_blocks = self._extract_text_blocks(content, tables)
+        text_blocks = self._extract_text_blocks(content, tables, page_content.width)
         image_blocks = self._extract_image_ocr_blocks(content)
         strategy = self._classify_page(text_blocks, image_blocks)
         if self._should_force_ocr(text_blocks):
@@ -290,58 +291,53 @@ class PDFToWordConverter:
         page_content.tables = tables
         return page_content
 
-    def _extract_text_blocks(self, content: dict, tables: Sequence[TableBlock]) -> List[TextBlock]:
-        results: List[TextBlock] = []
+    def _extract_text_blocks(
+        self,
+        content: dict,
+        tables: Sequence[TableBlock],
+        page_width: float,
+    ) -> List[TextBlock]:
+        line_blocks: List[TextBlock] = []
 
         for block in content.get("blocks", []):
             if block.get("type") != 0:
                 continue
 
-            bbox = tuple(float(value) for value in block.get("bbox", (0, 0, 0, 0)))
-            if any(self._overlap_ratio(bbox, table.bbox) > 0.55 for table in tables):
-                continue
-
-            lines: List[str] = []
-            font_sizes: List[float] = []
-            line_lefts: List[float] = []
-            line_rights: List[float] = []
-            is_bold = False
             for line in block.get("lines", []):
+                line_bbox_raw = line.get("bbox") or block.get("bbox", (0, 0, 0, 0))
+                line_bbox = tuple(float(value) for value in line_bbox_raw[:4])
+                if any(self._overlap_ratio(line_bbox, table.bbox) > 0.55 for table in tables):
+                    continue
+
                 spans = line.get("spans", [])
                 line_text = self._join_line_spans(spans)
                 if not line_text:
                     continue
-                lines.append(line_text)
-                line_bbox = line.get("bbox")
-                if line_bbox and len(line_bbox) >= 4:
-                    line_lefts.append(float(line_bbox[0]))
-                    line_rights.append(float(line_bbox[2]))
+
+                font_sizes: List[float] = []
+                bold_hits = 0
                 for span in spans:
                     size = span.get("size")
                     if size:
                         font_sizes.append(float(size))
                     if "bold" in str(span.get("font", "")).lower():
-                        is_bold = True
+                        bold_hits += 1
 
-            text = "\n".join(lines).strip()
-            if not text:
-                continue
-
-            font_size = max(font_sizes) if font_sizes else 11.0
-            kind = "title" if self._looks_like_title(text, font_size, is_bold) else "text"
-            results.append(
+                font_size = max(font_sizes) if font_sizes else 11.0
+                is_bold = bold_hits > 0 and bold_hits >= max(1, len(spans) // 2)
+                line_blocks.append(
                 TextBlock(
-                    bbox=bbox,
-                    text=text,
-                    font_size=font_size,
-                    is_bold=is_bold,
-                    kind=kind,
-                    line_lefts=line_lefts,
-                    line_rights=line_rights,
+                        bbox=line_bbox,
+                        text=line_text,
+                        font_size=font_size,
+                        is_bold=is_bold,
+                        kind="text",
+                        line_lefts=[line_bbox[0]],
+                        line_rights=[line_bbox[2]],
+                    )
                 )
-            )
 
-        return results
+        return self._merge_direct_text_lines(line_blocks, page_width)
 
     def _join_line_spans(self, spans: Sequence[dict]) -> str:
         pieces: List[str] = []
@@ -375,6 +371,88 @@ class PDFToWordConverter:
             prev_text = text
 
         return self._normalize_text("".join(pieces))
+
+    def _merge_direct_text_lines(
+        self,
+        line_blocks: Sequence[TextBlock],
+        page_width: float,
+    ) -> List[TextBlock]:
+        if not line_blocks:
+            return []
+
+        ordered = sorted(line_blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
+        merged: List[TextBlock] = [self._clone_block(ordered[0])]
+
+        for line in ordered[1:]:
+            previous = merged[-1]
+            if self._should_merge_direct_line(previous, line, page_width):
+                previous.text = f"{previous.text}\n{line.text}"
+                previous.bbox = (
+                    min(previous.bbox[0], line.bbox[0]),
+                    min(previous.bbox[1], line.bbox[1]),
+                    max(previous.bbox[2], line.bbox[2]),
+                    max(previous.bbox[3], line.bbox[3]),
+                )
+                previous.font_size = max(previous.font_size, line.font_size)
+                previous.is_bold = previous.is_bold and line.is_bold
+                previous.line_lefts.extend(line.line_lefts)
+                previous.line_rights.extend(line.line_rights)
+            else:
+                merged.append(self._clone_block(line))
+
+        for block in merged:
+            block.kind = self._classify_text_block_kind(block, page_width)
+
+        return merged
+
+    def _clone_block(self, block: TextBlock) -> TextBlock:
+        return TextBlock(
+            bbox=block.bbox,
+            text=block.text,
+            font_size=block.font_size,
+            is_bold=block.is_bold,
+            kind=block.kind,
+            line_lefts=list(block.line_lefts),
+            line_rights=list(block.line_rights),
+        )
+
+    def _should_merge_direct_line(
+        self,
+        previous: TextBlock,
+        current: TextBlock,
+        page_width: float,
+    ) -> bool:
+        previous_lines = [line.strip() for line in previous.text.splitlines() if line.strip()]
+        current_text = current.text.strip()
+        if not previous_lines or not current_text:
+            return False
+        if self._is_list_block([previous_lines[-1]]) or self._is_list_block([current_text]):
+            return False
+        if self._is_heading_candidate(previous, page_width) or self._is_heading_candidate(current, page_width):
+            return False
+
+        vertical_gap = current.bbox[1] - previous.bbox[3]
+        max_gap = max(5.0, min(previous.font_size, current.font_size) * 0.9)
+        if vertical_gap > max_gap:
+            return False
+
+        left_tolerance = max(14.0, page_width * 0.025)
+        previous_body_left = min(previous.line_lefts) if previous.line_lefts else previous.bbox[0]
+        current_left = current.line_lefts[0] if current.line_lefts else current.bbox[0]
+        if abs(current_left - previous_body_left) > left_tolerance:
+            return False
+
+        font_delta = abs(previous.font_size - current.font_size)
+        if font_delta > 1.6:
+            return False
+
+        previous_last_line = previous_lines[-1]
+        previous_width = (previous.line_rights[-1] - previous.line_lefts[-1]) if previous.line_lefts and previous.line_rights else (previous.bbox[2] - previous.bbox[0])
+        width_ratio = previous_width / max(1.0, page_width)
+        if previous_last_line.endswith(self.SENTENCE_ENDINGS) and width_ratio < 0.58:
+            return False
+
+        return True
 
     def _extract_image_ocr_blocks(self, content: dict) -> List[TextBlock]:
         if not self.ocr_callback:
@@ -733,6 +811,7 @@ class PDFToWordConverter:
                 blocks.append((table_block.bbox[1], "table", table_block))
             blocks.sort(key=lambda item: item[0])
             previous_bottom: Optional[float] = None
+            page_left_ref, page_right_ref = self._estimate_page_text_bounds(page)
 
             if not blocks:
                 doc.add_paragraph("")
@@ -744,6 +823,8 @@ class PDFToWordConverter:
                         block,
                         page.width,
                         page.height,
+                        page_left_ref,
+                        page_right_ref,
                         previous_bottom=previous_bottom,
                     )
                 else:
@@ -774,13 +855,23 @@ class PDFToWordConverter:
         block: TextBlock,
         page_width: float,
         page_height: float,
+        page_left_ref: float,
+        page_right_ref: float,
         previous_bottom: Optional[float] = None,
     ) -> None:
         paragraph = doc.add_paragraph()
-        self._apply_paragraph_geometry(paragraph, block, page_width, page_height, previous_bottom)
+        self._apply_paragraph_geometry(
+            paragraph,
+            block,
+            page_width,
+            page_height,
+            page_left_ref,
+            page_right_ref,
+            previous_bottom,
+        )
         paragraph.alignment = self._get_paragraph_alignment(block, page_width)
 
-        lines = block.text.splitlines() or [block.text]
+        lines = self._prepare_output_lines(block)
         for line_index, line in enumerate(lines):
             run = paragraph.add_run(line)
             run.bold = block.is_bold or block.kind == "title"
@@ -821,6 +912,8 @@ class PDFToWordConverter:
         block: TextBlock,
         page_width: float,
         page_height: float,
+        page_left_ref: float,
+        page_right_ref: float,
         previous_bottom: Optional[float],
     ) -> None:
         paragraph_format = paragraph.paragraph_format
@@ -832,12 +925,12 @@ class PDFToWordConverter:
             paragraph_format.left_indent = Pt(0)
             paragraph_format.right_indent = Pt(0)
         else:
-            left_indent_pt = self._scale_horizontal(max(0.0, block.bbox[0]), page_width)
+            left_indent_pt = self._scale_horizontal(max(0.0, block.bbox[0] - page_left_ref), page_width)
             right_indent_pt = self._scale_horizontal(
-                max(0.0, page_width - block.bbox[2]),
+                max(0.0, page_right_ref - block.bbox[2]),
                 page_width,
             )
-            max_side_indent = self._content_width_pt() * 0.55
+            max_side_indent = self._content_width_pt() * 0.35
             paragraph_format.left_indent = Pt(min(left_indent_pt, max_side_indent))
             paragraph_format.right_indent = Pt(min(right_indent_pt, max_side_indent))
 
@@ -870,6 +963,23 @@ class PDFToWordConverter:
             self.DOC_PAGE_HEIGHT_CM - self.DOC_MARGIN_TOP_CM - self.DOC_MARGIN_BOTTOM_CM
         ) * self.POINTS_PER_CM
 
+    def _estimate_page_text_bounds(self, page: PageContent) -> Tuple[float, float]:
+        candidates = [
+            block
+            for block in page.text_blocks
+            if block.kind != "title" and (block.bbox[2] - block.bbox[0]) >= page.width * 0.35
+        ]
+        if not candidates:
+            candidates = list(page.text_blocks)
+        if not candidates:
+            return 0.0, page.width
+
+        left = min(block.bbox[0] for block in candidates)
+        right = max(block.bbox[2] for block in candidates)
+        if right <= left:
+            return 0.0, page.width
+        return left, right
+
     def _estimate_first_line_indent(self, block: TextBlock, page_width: float) -> float:
         if block.kind == "title":
             return 0.0
@@ -889,6 +999,67 @@ class PDFToWordConverter:
         max_indent_pt = self._content_width_pt() * 0.12
         scaled = self._scale_horizontal(delta, page_width)
         return max(-max_indent_pt, min(max_indent_pt, scaled))
+
+    def _classify_text_block_kind(self, block: TextBlock, page_width: float) -> str:
+        lines = [line.strip() for line in block.text.splitlines() if line.strip()]
+        if self._is_list_block(lines):
+            return "list"
+        if self._is_heading_candidate(block, page_width):
+            return "title"
+        return "text"
+
+    def _is_heading_candidate(self, block: TextBlock, page_width: float) -> bool:
+        text = block.text.strip()
+        if not text:
+            return False
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines or self._is_list_block(lines):
+            return False
+        if self._ends_like_heading(text):
+            return False
+
+        width = max(1.0, block.bbox[2] - block.bbox[0])
+        is_centered = self._should_center_block(block, page_width, lines)
+        all_caps = self._is_mostly_upper(text)
+        numbered_heading = bool(re.match(r"^([A-ZÄ]\.|[IVXLCDM]+\.)\s+|^\d+([.)]\d*)*\s+", lines[0]))
+
+        if block.font_size >= 15 and len(text) <= 220:
+            return True
+        if is_centered and (all_caps or block.font_size >= 13):
+            return True
+        if numbered_heading and (block.is_bold or block.font_size >= 12):
+            return True
+        return False
+
+    def _is_mostly_upper(self, text: str) -> bool:
+        letters = [char for char in text if char.isalpha()]
+        if not letters:
+            return False
+        uppercase_letters = [char for char in letters if char.isupper()]
+        return len(uppercase_letters) / len(letters) >= 0.72
+
+    def _prepare_output_lines(self, block: TextBlock) -> List[str]:
+        raw_lines = [line.strip() for line in block.text.splitlines() if line.strip()]
+        if not raw_lines:
+            return [block.text.strip()] if block.text.strip() else [""]
+        if block.kind == "title" or self._is_list_block(raw_lines):
+            return raw_lines
+        return [self._join_wrapped_lines(raw_lines)]
+
+    def _join_wrapped_lines(self, lines: Sequence[str]) -> str:
+        merged_parts: List[str] = []
+        for line in lines:
+            if not merged_parts:
+                merged_parts.append(line)
+                continue
+
+            previous = merged_parts[-1]
+            if previous.endswith("-"):
+                merged_parts[-1] = previous[:-1] + line
+            else:
+                merged_parts[-1] = f"{previous} {line}"
+
+        return " ".join(part.strip() for part in merged_parts if part.strip())
 
     def _get_paragraph_alignment(self, block: TextBlock, page_width: float):
         text = block.text.strip()
@@ -972,9 +1143,11 @@ class PDFToWordConverter:
             return False
         if clean_text.endswith((".", ":", ";", ",")):
             return False
-        if font_size >= 14:
+        if font_size >= 15:
             return True
-        if is_bold and len(clean_text) <= 90 and len(clean_text.splitlines()) <= 2:
+        if self._is_mostly_upper(clean_text) and len(clean_text) <= 180:
+            return True
+        if is_bold and len(clean_text) <= 80 and re.match(r"^\d+([.)]\d*)*\s+", clean_text):
             return True
         return False
 

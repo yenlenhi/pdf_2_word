@@ -1,25 +1,28 @@
 # ============================================================================
-# PDF-FIRST VIETNAMESE OCR - MINIMAL WINDOWS SETUP
-# Focused on practical PDF -> Word conversion.
+# Streamlit Cloud-safe dependencies
+# Target: Python 3.11/3.14 without PaddlePaddle.
 # ============================================================================
 
 # Core app
-streamlit>=1.35.0
-opencv-python-headless>=4.9.0
-Pillow>=10.3.0
-numpy>=1.26.4
+streamlit>=1.35,<2
+opencv-python-headless>=4.10
+Pillow>=10.4
+numpy>=2.1
 
-# Primary OCR - pytesseract (PaddleOCR is optional, install separately if needed)
-pytesseract==0.3.10
-# paddlepaddle and paddleocr not supported on Python 3.14 (Streamlit Cloud)
-# Install manually if running locally: pip install paddlepaddle paddleocr
+# OCR
+pytesseract>=0.3.13
+# PaddleOCR/PaddlePaddle are intentionally excluded here.
+# Streamlit Cloud currently provisions Python versions where Paddle wheels are
+# not consistently available. Keep Paddle as a local-only optional install.
+#
+# Local optional install:
+#   pip install paddlepaddle paddleocr
 
 # PDF and Word generation
-PyMuPDF==1.23.8
-python-docx==1.1.2
+PyMuPDF>=1.26.3
+python-docx>=1.1.2
 
-# Optional fallback OCR, only install if you really need them:
-# easyocr==1.7.0
-# torch==2.2.0
-# torchvision==0.17.0
-# transformers==4.35.0
+# Optional fallback OCR, local only:
+# easyocr>=1.7.1
+# torch>=2.3
+# torchvision>=0.18
