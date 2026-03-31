@@ -110,6 +110,8 @@ class TextBlock:
     font_size: float = 11.0
     is_bold: bool = False
     kind: str = "text"
+    line_lefts: List[float] = field(default_factory=list)
+    line_rights: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -144,6 +146,14 @@ class PDFToWordConversionResult:
 
 
 class PDFToWordConverter:
+    DOC_PAGE_WIDTH_CM = 21.0
+    DOC_PAGE_HEIGHT_CM = 29.7
+    DOC_MARGIN_TOP_CM = 1.8
+    DOC_MARGIN_BOTTOM_CM = 1.8
+    DOC_MARGIN_LEFT_CM = 2.0
+    DOC_MARGIN_RIGHT_CM = 2.0
+    POINTS_PER_CM = 28.3464567
+
     def __init__(self, ocr_callback: Optional[Callable[[Image.Image], str]] = None):
         self.ocr_callback = ocr_callback
 
@@ -293,6 +303,8 @@ class PDFToWordConverter:
 
             lines: List[str] = []
             font_sizes: List[float] = []
+            line_lefts: List[float] = []
+            line_rights: List[float] = []
             is_bold = False
             for line in block.get("lines", []):
                 spans = line.get("spans", [])
@@ -300,6 +312,10 @@ class PDFToWordConverter:
                 if not line_text:
                     continue
                 lines.append(line_text)
+                line_bbox = line.get("bbox")
+                if line_bbox and len(line_bbox) >= 4:
+                    line_lefts.append(float(line_bbox[0]))
+                    line_rights.append(float(line_bbox[2]))
                 for span in spans:
                     size = span.get("size")
                     if size:
@@ -320,6 +336,8 @@ class PDFToWordConverter:
                     font_size=font_size,
                     is_bold=is_bold,
                     kind=kind,
+                    line_lefts=line_lefts,
+                    line_rights=line_rights,
                 )
             )
 
@@ -393,6 +411,8 @@ class PDFToWordConverter:
                     font_size=11.0,
                     is_bold=False,
                     kind="ocr",
+                    line_lefts=[],
+                    line_rights=[],
                 )
             )
 
@@ -592,6 +612,8 @@ class PDFToWordConverter:
                     font_size=11.0,
                     is_bold=False,
                     kind="ocr",
+                    line_lefts=[],
+                    line_rights=[],
                 )
             ]
 
@@ -616,6 +638,8 @@ class PDFToWordConverter:
                     font_size=max(11.0, min(16.0, block_height * 0.55)),
                     is_bold=False,
                     kind="ocr",
+                    line_lefts=[],
+                    line_rights=[],
                 )
             )
 
@@ -690,6 +714,8 @@ class PDFToWordConverter:
                     max(prev.bbox[3], block.bbox[3]),
                 )
                 prev.font_size = max(prev.font_size, block.font_size)
+                prev.line_lefts.extend(block.line_lefts)
+                prev.line_rights.extend(block.line_rights)
             else:
                 merged.append(block)
 
@@ -706,15 +732,23 @@ class PDFToWordConverter:
             for table_block in page.tables:
                 blocks.append((table_block.bbox[1], "table", table_block))
             blocks.sort(key=lambda item: item[0])
+            previous_bottom: Optional[float] = None
 
             if not blocks:
                 doc.add_paragraph("")
 
             for _, block_type, block in blocks:
                 if block_type == "text":
-                    self._write_text_block(doc, block)
+                    self._write_text_block(
+                        doc,
+                        block,
+                        page.width,
+                        page.height,
+                        previous_bottom=previous_bottom,
+                    )
                 else:
                     self._write_table(doc, block)
+                previous_bottom = block.bbox[3]
 
             if index < len(pages) - 1:
                 doc.add_page_break()
@@ -727,16 +761,24 @@ class PDFToWordConverter:
         style.font.size = Pt(11)
 
         for section in doc.sections:
-            section.top_margin = Cm(1.8)
-            section.bottom_margin = Cm(1.8)
-            section.left_margin = Cm(2.0)
-            section.right_margin = Cm(2.0)
+            section.page_width = Cm(self.DOC_PAGE_WIDTH_CM)
+            section.page_height = Cm(self.DOC_PAGE_HEIGHT_CM)
+            section.top_margin = Cm(self.DOC_MARGIN_TOP_CM)
+            section.bottom_margin = Cm(self.DOC_MARGIN_BOTTOM_CM)
+            section.left_margin = Cm(self.DOC_MARGIN_LEFT_CM)
+            section.right_margin = Cm(self.DOC_MARGIN_RIGHT_CM)
 
-    def _write_text_block(self, doc, block: TextBlock) -> None:
+    def _write_text_block(
+        self,
+        doc,
+        block: TextBlock,
+        page_width: float,
+        page_height: float,
+        previous_bottom: Optional[float] = None,
+    ) -> None:
         paragraph = doc.add_paragraph()
-        paragraph.paragraph_format.space_after = Pt(4)
-        if block.kind == "title":
-            paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        self._apply_paragraph_geometry(paragraph, block, page_width, page_height, previous_bottom)
+        paragraph.alignment = self._get_paragraph_alignment(block, page_width)
 
         lines = block.text.splitlines() or [block.text]
         for line_index, line in enumerate(lines):
@@ -773,6 +815,130 @@ class PDFToWordConverter:
         buffer.seek(0)
         return buffer.read()
 
+    def _apply_paragraph_geometry(
+        self,
+        paragraph,
+        block: TextBlock,
+        page_width: float,
+        page_height: float,
+        previous_bottom: Optional[float],
+    ) -> None:
+        paragraph_format = paragraph.paragraph_format
+        paragraph_format.space_after = Pt(4)
+
+        lines = [line.strip() for line in block.text.splitlines() if line.strip()]
+        should_center = self._should_center_block(block, page_width, lines)
+        if should_center:
+            paragraph_format.left_indent = Pt(0)
+            paragraph_format.right_indent = Pt(0)
+        else:
+            left_indent_pt = self._scale_horizontal(max(0.0, block.bbox[0]), page_width)
+            right_indent_pt = self._scale_horizontal(
+                max(0.0, page_width - block.bbox[2]),
+                page_width,
+            )
+            max_side_indent = self._content_width_pt() * 0.55
+            paragraph_format.left_indent = Pt(min(left_indent_pt, max_side_indent))
+            paragraph_format.right_indent = Pt(min(right_indent_pt, max_side_indent))
+
+        paragraph_format.first_line_indent = Pt(self._estimate_first_line_indent(block, page_width))
+
+        if previous_bottom is None:
+            paragraph_format.space_before = Pt(0)
+        else:
+            gap = max(0.0, block.bbox[1] - previous_bottom)
+            gap_pt = self._scale_vertical(gap, page_height)
+            paragraph_format.space_before = Pt(min(18.0, gap_pt * 0.85))
+
+    def _scale_horizontal(self, value: float, page_width: float) -> float:
+        if page_width <= 0:
+            return 0.0
+        return max(0.0, value / page_width) * self._content_width_pt()
+
+    def _scale_vertical(self, value: float, page_height: float) -> float:
+        if page_height <= 0:
+            return 0.0
+        return max(0.0, value / page_height) * self._content_height_pt()
+
+    def _content_width_pt(self) -> float:
+        return (
+            self.DOC_PAGE_WIDTH_CM - self.DOC_MARGIN_LEFT_CM - self.DOC_MARGIN_RIGHT_CM
+        ) * self.POINTS_PER_CM
+
+    def _content_height_pt(self) -> float:
+        return (
+            self.DOC_PAGE_HEIGHT_CM - self.DOC_MARGIN_TOP_CM - self.DOC_MARGIN_BOTTOM_CM
+        ) * self.POINTS_PER_CM
+
+    def _estimate_first_line_indent(self, block: TextBlock, page_width: float) -> float:
+        if block.kind == "title":
+            return 0.0
+
+        lines = [line.strip() for line in block.text.splitlines() if line.strip()]
+        if self._is_list_block(lines):
+            return 0.0
+        if len(block.line_lefts) < 2:
+            return 0.0
+
+        first_left = block.line_lefts[0]
+        body_left = min(block.line_lefts[1:])
+        delta = first_left - body_left
+        if abs(delta) < page_width * 0.01:
+            return 0.0
+
+        max_indent_pt = self._content_width_pt() * 0.12
+        scaled = self._scale_horizontal(delta, page_width)
+        return max(-max_indent_pt, min(max_indent_pt, scaled))
+
+    def _get_paragraph_alignment(self, block: TextBlock, page_width: float):
+        text = block.text.strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not text:
+            return WD_PARAGRAPH_ALIGNMENT.LEFT
+        if self._should_center_block(block, page_width, lines):
+            return WD_PARAGRAPH_ALIGNMENT.CENTER
+        if self._is_list_block(lines):
+            return WD_PARAGRAPH_ALIGNMENT.LEFT
+        if len(text) >= 60 and not self._ends_like_heading(text):
+            return WD_PARAGRAPH_ALIGNMENT.JUSTIFY
+        return WD_PARAGRAPH_ALIGNMENT.LEFT
+
+    def _should_center_block(
+        self,
+        block: TextBlock,
+        page_width: float,
+        lines: Sequence[str],
+    ) -> bool:
+        if block.kind != "title" or not lines:
+            return False
+        if self._is_list_block(lines):
+            return False
+
+        text = block.text.strip()
+        if len(lines) > 2 or len(text) > 140:
+            return False
+        if self._ends_like_heading(text):
+            return False
+
+        block_left, _, block_right, _ = block.bbox
+        block_width = max(1.0, block_right - block_left)
+        block_center = (block_left + block_right) / 2
+        center_offset = abs(block_center - (page_width / 2))
+        left_margin = block_left
+        right_margin = max(0.0, page_width - block_right)
+
+        return (
+            block_width <= page_width * 0.72
+            and center_offset <= page_width * 0.08
+            and abs(left_margin - right_margin) <= page_width * 0.12
+        )
+
+    def _is_list_block(self, lines: Sequence[str]) -> bool:
+        return any(re.match(r"^([•\-*o○]|[0-9]+[.)]|[A-Za-z][.)])\s+", line) for line in lines)
+
+    def _ends_like_heading(self, text: str) -> bool:
+        return text.endswith((".", ":", ";", ","))
+
     def _pages_to_text(self, pages: Sequence[PageContent]) -> str:
         chunks = []
         for page in pages:
@@ -799,9 +965,16 @@ class PDFToWordConverter:
         return text.strip()
 
     def _looks_like_title(self, text: str, font_size: float, is_bold: bool) -> bool:
+        clean_text = text.strip()
+        if not clean_text:
+            return False
+        if re.match(r"^([•\-*o○]|[0-9]+[.)]|[A-Za-z][.)])\s+", clean_text):
+            return False
+        if clean_text.endswith((".", ":", ";", ",")):
+            return False
         if font_size >= 14:
             return True
-        if is_bold and len(text) <= 120:
+        if is_bold and len(clean_text) <= 90 and len(clean_text.splitlines()) <= 2:
             return True
         return False
 
