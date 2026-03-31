@@ -4,14 +4,14 @@
 # ============================================================================
 
 # Core app
-streamlit==1.32.2
-opencv-python==4.6.0.66
-Pillow==10.1.0
-numpy==1.26.4
+streamlit>=1.35.0
+opencv-python-headless>=4.9.0
+Pillow>=10.3.0
+numpy>=1.26.4
 
 # Primary OCR stack for Vietnamese PDFs
-paddlepaddle>=2.6,<3.0
-paddleocr==2.7.3
+paddlepaddle>=3.0
+paddleocr>=2.7.3
 pytesseract==0.3.10
 
 # PDF and Word generation
