@@ -9,10 +9,10 @@ opencv-python-headless>=4.9.0
 Pillow>=10.3.0
 numpy>=1.26.4
 
-# Primary OCR stack for Vietnamese PDFs
-paddlepaddle>=3.0
-paddleocr>=2.7.3
+# Primary OCR - pytesseract (PaddleOCR is optional, install separately if needed)
 pytesseract==0.3.10
+# paddlepaddle and paddleocr not supported on Python 3.14 (Streamlit Cloud)
+# Install manually if running locally: pip install paddlepaddle paddleocr
 
 # PDF and Word generation
 PyMuPDF==1.23.8
