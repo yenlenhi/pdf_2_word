@@ -1,0 +1,25 @@
+# ============================================================================
+# PDF-FIRST VIETNAMESE OCR - MINIMAL WINDOWS SETUP
+# Focused on practical PDF -> Word conversion.
+# ============================================================================
+
+# Core app
+streamlit==1.32.2
+opencv-python==4.6.0.66
+Pillow==10.1.0
+numpy==1.26.4
+
+# Primary OCR stack for Vietnamese PDFs
+paddlepaddle>=2.6,<3.0
+paddleocr==2.7.3
+pytesseract==0.3.10
+
+# PDF and Word generation
+PyMuPDF==1.23.8
+python-docx==1.1.2
+
+# Optional fallback OCR, only install if you really need them:
+# easyocr==1.7.0
+# torch==2.2.0
+# torchvision==0.17.0
+# transformers==4.35.0
